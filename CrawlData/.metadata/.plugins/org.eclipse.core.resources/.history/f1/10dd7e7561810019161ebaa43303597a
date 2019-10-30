@@ -1,0 +1,309 @@
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.sql.Connection;
+import java.sql.Date;
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+
+public class CrawlData implements Runnable {
+	private static BlockingQueue<String> listURL = new LinkedBlockingQueue<>();
+	private static Set<String> oldURL = new HashSet<>();
+	private static String urlStart;
+	private static BlockingQueue<Map<String, List<String>>> listData = new LinkedBlockingQueue<>();
+
+	private static final String FILES_OLD_URL = "files/oldUrl.dat";
+	private static Map<String, Map<List<String>, String>> mapQuerySelector;
+	PrintStream pwOut_oldUrl;
+
+	public CrawlData() {
+		super();
+	}
+
+	public CrawlData(String url, Map<String, Map<List<String>, String>> mapQuerySelector) {
+		System.setProperty("https.protocols", "TLSv1,TLSv1.1,TLSv1.2");
+		CrawlData.mapQuerySelector = mapQuerySelector;
+		CrawlData.urlStart = url;
+		listURL.add(url);
+
+		System.err.println("Crawl.Constructor =" + urlStart);
+
+		setUpdate_OldUrl();
+		oldURL = new FileService().readOldUrl(new File(FILES_OLD_URL));
+	}
+
+	private void setUpdate_OldUrl() {
+		File file = new File(FILES_OLD_URL);
+		try {
+			if (!file.exists()) {
+				file.createNewFile();
+			}
+			FileOutputStream fos = new FileOutputStream(file, true);
+			PrintStream ps_oldUrl = new PrintStream(fos);
+			System.setOut(ps_oldUrl);
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+		System.err.println("Crawl.setUpdate_OldUrl done");
+	}
+
+	public CrawlData(String url) {
+		System.err.println("Crawl.Constructor =" + url);
+		setUpdate_OldUrl();
+
+		urlStart = url;
+		listURL.add(url);
+		
+		// read old url from files
+		oldURL = new FileService().readOldUrl(new File(FILES_OLD_URL));
+	}
+
+	static class GetLinkRunable implements Runnable {
+		private static Map<String, String> tailHTML;
+		private static String tailOfUrlStart;
+
+		public GetLinkRunable() {
+			super();
+			tailHTML = TailHTML.getInfoWebsite();
+			tailOfUrlStart = tailHTML.get(urlStart);
+		}
+
+		@Override
+		public void run() {
+			System.err.println("Crawl.GetLinkRunable.run...");
+			while (true) {
+				if(listURL.size() > 0)
+					listURL.addAll(getLinks(listURL.peek()));
+			}
+		}
+
+		private boolean URL_ExistsAndFull(String url) {
+			int oldSize = oldURL.size();
+			oldURL.add(url);
+			int newSize = oldURL.size();
+			if (oldSize >= Integer.MAX_VALUE - 1) {
+				oldURL.clear();
+				oldURL.add(url);
+			}
+			return (oldSize != newSize);
+		}
+
+		private  Queue<String> getLinks(String url) {
+			Queue<String> urlNext = new LinkedList<>();
+			try {
+				Document document = Jsoup.connect(url).data("query", "Java")
+						.userAgent("Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:25.0) Gecko/20100101 Firefox/25.0")
+						.ignoreHttpErrors(true).timeout(1000 * 30).post();
+
+				Elements elements = document.body().select("a[href]");
+				elements.forEach((element) -> {
+					String nextLink = element.attr("href");
+
+					if (!nextLink.startsWith("http")) {
+						nextLink = urlStart + nextLink;
+					}
+					if (nextLink.endsWith(tailOfUrlStart) && URL_ExistsAndFull(nextLink)) {
+						urlNext.add(nextLink);
+					}
+				});
+
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+			return urlNext;
+		}
+	}
+
+	static class GetData implements Runnable {
+
+		GetLinkRunable t = new GetLinkRunable();
+
+		public GetData() {
+			super();
+			System.err.println("Crawl.GetData.Constructor");
+		}
+
+		public List<String> getTextIgnore(Document document, Map<List<String>, String> isMap) {
+			List<String> textIgnore = new ArrayList<>();
+			isMap.forEach((liKey, strValue) -> {
+				liKey.forEach((list) -> {
+					Elements elements = document.select(list);
+					for (Element element : elements) {
+						textIgnore.add(element.text());
+					}
+				});
+			});
+
+			return textIgnore;
+		}
+
+		private boolean getData(String url) {
+			try {
+				Document document = Jsoup.connect(url.trim()).data("query", "Java")
+						.userAgent("Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:25.0) Gecko/20100101 Firefox/25.0")
+						.ignoreHttpErrors(true).timeout(1000 * 30).post();
+				RegexService reService = new RegexService();
+
+				Map<String, List<String>> data = new LinkedHashMap<>();
+				data.put("URL", new ArrayList<String>(Arrays.asList(url)));
+
+				// ignore text
+				List<String> textIgnore = getTextIgnore(document, mapQuerySelector.get("ContentIgnore"));
+
+				mapQuerySelector.forEach((key, listMap) -> {
+					listMap.forEach((values, regex) -> {
+						values.forEach((list) -> {
+
+							Elements elements = document.select(list);
+							List<String> arrList = new ArrayList<>();
+							for (Element element : elements) {
+								arrList.addAll(reService.isRegex(element.outerHtml(), regex, textIgnore));
+							}
+							data.put(key, arrList);
+						});
+					});
+				});
+
+				List<String> description = data.get("Description");
+				List<String> title = data.get("Title");
+				List<String> timePost = data.get("TimePost");
+				String strTimePost = null;
+				if (timePost.size() > 0)
+					strTimePost = timePost.get(0);
+
+				if (!URL_Virtual(title, description, timePost) && checkDate(strTimePost)) {
+					listData.add(data);
+					return true;
+				}
+
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+			return false;
+		}
+
+		private boolean URL_Virtual(List<String> title, List<String> description, List<String> timePost) {
+			return ((title.isEmpty() && description.isEmpty()) || (title.isEmpty() && timePost.isEmpty())
+					|| (description.isEmpty() && timePost.isEmpty()));
+		}
+
+		private boolean checkDate(String timePost) {
+			LocalDate beforeToday_1Month = LocalDate.now().minusMonths(1);
+			LocalDate dateCheck = new Convert().convertStringToLocalDate(timePost);
+
+			return (dateCheck.isAfter(beforeToday_1Month));
+		}
+
+		@Override
+		public  void run() {
+			System.err.println("Crawl.GetData.run...");
+			while (true) {
+				if (!listURL.isEmpty()) {
+					String url = listURL.poll();
+					boolean ok = getData(url);
+					if (ok) {
+						System.out.println(url);	// push into file
+					} else {
+//						System.err.println(url);
+						listURL.add(url);
+					}
+				}
+			}
+
+		}
+
+	}
+
+	class PushDataToDatabase implements Runnable {
+		Connect connect = new Connect();
+		Connection conn = Connect.getConnection();
+
+		public PushDataToDatabase() {
+			super();
+		}
+
+		private void insertData(Map<String, List<String>> data) {
+			String url, title, description, type, image, content, tags, author, timepost;
+			LocalDate timePost;
+			List<String> URL, Type, Description, Content, Title, Author, TimePost, Image, Tags;
+
+			if (data != null && data.size() > 0) {
+				
+				URL = data.get("URL");
+				Type = data.get("Type");
+				Description = data.get("Description");
+				Content = data.get("Content");
+				Title = data.get("Title");
+				Author = data.get("Author");
+				TimePost = data.get("TimePost");
+				Image = data.get("Image");
+				Tags = data.get("Tags");
+				
+				data.forEach((key, values)->{
+					System.err.println(key + " -> " + values);
+				});
+
+				url = getDataFromList(URL);
+				title = getDataFromList(Title);
+				description = getDataFromList(Description);
+				type = getDataFromList(Type);
+				author = getDataFromList(Author);
+				timepost = getDataFromList(TimePost);
+				image = Image.toString();
+				tags = Tags.toString();
+				content = Content.toString();
+
+				timePost = new Convert().convertStringToLocalDate(timepost);
+
+				connect.Insert(Date.valueOf(timePost), url, title, author, description, content, type, image, tags);
+			}
+
+		}
+
+		private String getDataFromList(List<String> uRL) {
+			String text = "";
+
+			if (uRL.size() > 0)
+				text = uRL.get(0);
+
+			return text;
+		}
+
+		@Override
+		public void run() {
+			while (true) {
+				if (!listData.isEmpty()) {
+					Map<String, List<String>> data = listData.poll();
+
+					insertData(data);
+				}
+			}
+		}
+
+	}
+
+	@Override
+	public void run() {
+		System.err.println("Crawl.run...");
+		new Thread(new GetLinkRunable()).start();
+		new Thread(new GetData()).start();
+		new Thread(new PushDataToDatabase()).start();
+	}
+
+}

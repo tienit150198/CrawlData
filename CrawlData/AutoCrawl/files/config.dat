@@ -1,0 +1,7 @@
+forName-->com.microsoft.sqlserver.jdbc.SQLServerDriver
+-- dbURL-->jdbc:sqlserver://localhost:1433; databaseName = CrawlData -- 
+server-->jdbc:sqlserver
+host-->localhost:1433
+database-->CrawlData
+userName-->sa
+password-->0973451109a
